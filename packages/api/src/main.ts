@@ -186,6 +186,7 @@ app.get("/openapi.json", (c) =>
       version: API_VERSION,
       upto: process.env.DIRECT_FACILITATOR_URL && process.env.THINK_WORKER_URL ? { ceilingUsdc: THINK_CEILING_USDC, feeUsdc: THINK_FEE_USDC } : null,
       plain: paid?.plain ?? [],
+      gateway: paid?.gateway ?? [],
       // A route costs its own price on the direct rail, never less than the floor: what a price of zero comes to.
       direct: paid && process.env.DIRECT_FACILITATOR_URL ? { floorUsdc: directPriceOf("0") } : null,
     }),

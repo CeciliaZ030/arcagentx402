@@ -32,6 +32,26 @@ const CAIP2: Record<SellerNetwork, Network> = { arc: "eip155:5042", arcTestnet: 
 const FACILITATOR: Record<SellerNetwork, string> = { arc: "https://gateway-api.circle.com", arcTestnet: "https://gateway-api-testnet.circle.com" };
 
 /**
+ * Every mainnet Circle's Gateway facilitator settles batched payments on, with the USDC it takes there
+ * (its /v1/x402/supported, read 2026-10-15). A buyer whose Gateway balance is on one of them pays from there,
+ * with no bridge first and no gas per call; what it pays lands in the seller's Gateway balance on that chain.
+ */
+export const GATEWAY_MAINNETS: Readonly<Record<string, { readonly name: string; readonly usdc: string }>> = {
+  "eip155:5042": { name: "Arc", usdc: "0x3600000000000000000000000000000000000000" },
+  "eip155:8453": { name: "Base", usdc: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" },
+  "eip155:1": { name: "Ethereum", usdc: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48" },
+  "eip155:42161": { name: "Arbitrum", usdc: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831" },
+  "eip155:10": { name: "Optimism", usdc: "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85" },
+  "eip155:137": { name: "Polygon", usdc: "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359" },
+  "eip155:43114": { name: "Avalanche", usdc: "0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E" },
+  "eip155:130": { name: "Unichain", usdc: "0x078D782b760474a361dDA0AF3839290b0EF57AD6" },
+  "eip155:146": { name: "Sonic", usdc: "0x29219dd400f2Bf60E5a23d13Be72B486D4038894" },
+  "eip155:480": { name: "World Chain", usdc: "0x79A02482A880bCE3F13e09Da970dC34db4CD24d1" },
+  "eip155:1329": { name: "Sei", usdc: "0xe15fC38F6D8c56aF07bbCBe3BAf5708A2Bf42392" },
+  "eip155:999": { name: "HyperEVM", usdc: "0xb88339CB7199b77E23DB6E890353E22632Ba630f" },
+};
+
+/**
  * A second rail, alongside Arc, on a network whose facilitator catalogues what it settles.
  *
  * The x402 discovery catalogue (the Bazaar) is filled by the facilitator that verifies a payment,
@@ -93,6 +113,12 @@ export interface SellerConfig {
    * One server settles one way per network, so pick per seller, not per route.
    */
   readonly settlement?: "gateway" | "direct";
+  /**
+   * More networks to take Circle Gateway payments on, besides the seller's own: a list, or "all" for every
+   * mainnet in GATEWAY_MAINNETS. Gateway settlement only, on mainnet. A network another rail already takes
+   * keeps that rail: one facilitator per network and scheme, so with a discovery rail on Base, Base stays plain.
+   */
+  readonly gatewayNetworks?: readonly Network[] | "all";
   /**
    * Told about every payment that passed verification, however it ended. Called without being
    * awaited and never allowed to throw into the payment: a slow or broken sink cannot hold a response.
@@ -171,6 +197,16 @@ export function resolveNetwork(cfg: SellerConfig): { network: Network; facilitat
 
 export const BASE_MAINNET: Network = "eip155:8453";
 
+/** The networks besides its own a seller takes Gateway payments on: known to Circle, not claimed by another rail. */
+export function gatewayExtraNetworks(cfg: SellerConfig): Network[] {
+  if (!cfg.gatewayNetworks || cfg.settlement === "direct" || cfg.network !== "arc") return [];
+  const own = CAIP2[cfg.network];
+  const taken = new Set<string>([own, ...(cfg.discovery ? [cfg.discovery.network ?? BASE_MAINNET] : [])]);
+  const wanted = cfg.gatewayNetworks === "all" ? (Object.keys(GATEWAY_MAINNETS) as Network[]) : cfg.gatewayNetworks;
+  for (const n of wanted) if (!(n in GATEWAY_MAINNETS)) throw new Error(`${n} is not a network Circle's Gateway settles on: ${Object.keys(GATEWAY_MAINNETS).join(", ")}`);
+  return [...new Set(wanted)].filter((n) => !taken.has(n));
+}
+
 export function buildRoutes(cfg: SellerConfig, network: Network, pattern: string, price: string, opts: RouteOptions): RouteConfig {
   const timeout = opts.maxTimeoutSeconds ? { maxTimeoutSeconds: opts.maxTimeoutSeconds } : {};
   if (opts.upto) return uptoRoute(cfg, network, pattern, price, opts);
@@ -179,9 +215,10 @@ export function buildRoutes(cfg: SellerConfig, network: Network, pattern: string
   const arc = { scheme: "exact", network, payTo: cfg.sellerAddress, price: arcPrice, ...timeout };
   const rail = cfg.discovery;
   const method = pattern.split(" ")[0] ?? "GET";
-  // Arc first: a buyer that can pay there should. Then the catalogued rail, then Solana.
+  // Arc first: a buyer that can pay there should. Then Gateway on the other chains, the catalogued rail, Solana.
   const accepts = [
     arc,
+    ...gatewayExtraNetworks(cfg).map((n) => ({ scheme: "exact", network: n, payTo: cfg.sellerAddress, price, ...timeout })),
     ...(rail ? [{ scheme: "exact", network: rail.network ?? BASE_MAINNET, payTo: rail.payTo, price: atLeast(price, rail.minPrice), ...timeout }] : []),
     ...(cfg.solana ? [{ scheme: "exact", network: cfg.network === "arc" ? SOLANA_MAINNET : SOLANA_DEVNET, payTo: cfg.solana.payTo, price: atLeast(price, cfg.solana.minPrice), ...timeout }] : []),
   ];
@@ -310,21 +347,40 @@ function assembleServer(cfg: SellerConfig, network: Network, facilitatorUrl: str
   }
   const circle = new BatchFacilitatorClient({ url: facilitatorUrl }) as unknown as FacilitatorClient;
   const rail = cfg.discovery;
-  if (!rail && !cfg.solana) return new x402ResourceServer(circle).register(network, new GatewayEvmScheme());
+  const withGatewayChains = (server: x402ResourceServer): x402ResourceServer => {
+    for (const n of gatewayExtraNetworks(cfg)) server.register(n as Network, new GatewayEvmScheme());
+    return server;
+  };
+  if (!rail && !cfg.solana) return withGatewayChains(new x402ResourceServer(circle).register(network, new GatewayEvmScheme()));
   if (!rail) {
     // Solana alone: its facilitator does not claim Arc, so the order is free; it goes first for symmetry with below.
-    const payai = new HTTPFacilitatorClient({ url: cfg.solana!.facilitatorUrl ?? PAYAI_FACILITATOR });
-    return new x402ResourceServer([payai, circle]).register(network, new GatewayEvmScheme()).register(solanaNetwork(cfg), new ExactSvmScheme());
+    const payai = claimingNone(new HTTPFacilitatorClient({ url: cfg.solana!.facilitatorUrl ?? PAYAI_FACILITATOR }), new Set(gatewayExtraNetworks(cfg)));
+    return withGatewayChains(new x402ResourceServer([payai, circle]).register(network, new GatewayEvmScheme()).register(solanaNetwork(cfg), new ExactSvmScheme()));
   }
-  const catalogued = cataloguedClient(rail);
   // Order matters: the first facilitator that claims a network gets it. Circle claims Base too, so
   // the catalogued one goes first and Arc still lands on Circle, which is the only one that has it.
-  const solana = cfg.solana ? new HTTPFacilitatorClient({ url: cfg.solana.facilitatorUrl ?? PAYAI_FACILITATOR }) : null;
+  // The chains taken for Gateway are kept from the others, so a facilitator that starts listing one of
+  // them later cannot take its payments, which only Circle can settle.
+  const gateway = new Set<string>(gatewayExtraNetworks(cfg));
+  const catalogued = claimingNone(cataloguedClient(rail), gateway);
+  const solana = cfg.solana ? claimingNone(new HTTPFacilitatorClient({ url: cfg.solana.facilitatorUrl ?? PAYAI_FACILITATOR }), gateway) : null;
   const server = new x402ResourceServer(solana ? [catalogued, solana, circle] : [catalogued, circle])
     .register(network, new GatewayEvmScheme())
     .register(rail.network ?? BASE_MAINNET, new ExactEvmScheme())
     .registerExtension(bazaarResourceServerExtension);
+  for (const n of gateway) server.register(n as Network, new GatewayEvmScheme());
   return cfg.solana ? server.register(solanaNetwork(cfg), new ExactSvmScheme()) : server;
+}
+
+/** The same facilitator, minus the networks it must not take: they are left for the next one in line. */
+function claimingNone<T extends FacilitatorClient>(client: T, networks: ReadonlySet<string>): T {
+  if (networks.size === 0) return client;
+  const narrowed = Object.create(client) as T;
+  narrowed.getSupported = async () => {
+    const supported = await client.getSupported();
+    return { ...supported, kinds: supported.kinds.filter((k) => !networks.has(k.network)) };
+  };
+  return narrowed;
 }
 
 const solanaNetwork = (cfg: SellerConfig): Network => (cfg.network === "arc" ? SOLANA_MAINNET : SOLANA_DEVNET);

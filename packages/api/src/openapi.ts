@@ -21,6 +21,16 @@ export interface PlainRail {
   readonly minPrice?: string;
 }
 
+/** A chain besides Arc where a priced route takes Circle Gateway, at the Arc price. */
+export interface GatewayChain {
+  /** CAIP-2, e.g. eip155:137. */
+  readonly network: string;
+  /** How the text names it: Polygon, Arbitrum. */
+  readonly name: string;
+  /** The USDC Gateway takes there. */
+  readonly asset: string;
+}
+
 export interface OpenApiOptions {
   readonly origin: string;
   /** CAIP-2 network the payment settles on, e.g. eip155:5042. */
@@ -32,6 +42,8 @@ export interface OpenApiOptions {
   readonly upto?: { readonly ceilingUsdc: string; readonly feeUsdc: string } | null;
   /** The networks besides Arc that the priced routes and the thinking agent are also paid on. */
   readonly plain?: readonly PlainRail[];
+  /** The chains besides Arc where the priced routes also take Circle Gateway. */
+  readonly gateway?: readonly GatewayChain[];
   /** The same routes under /v1/direct, settled one by one on Arc, when that rail is on: the least a call costs there. */
   readonly direct?: { readonly floorUsdc: string } | null;
 }
@@ -39,8 +51,19 @@ export interface OpenApiOptions {
 /** "Arc", "Arc or Base", "Arc, Base or Solana". */
 const either = (names: readonly string[]): string => (names.length < 2 ? (names[0] ?? "") : `${names.slice(0, -1).join(", ")} or ${names.at(-1)}`);
 
-/** What a route costs on each network it is paid on, the way its 402 asks: "$0.0005 in USDC on Arc, $0.001 on Base or Solana". */
-function pricesOn(price: string, plain: readonly PlainRail[]): string {
+/**
+ * What a route costs on each network it is paid on, the way its 402 asks: "$0.0005 in USDC on Arc, $0.001 on Base
+ * or Solana", or, with Gateway on more chains, "$0.0005 in USDC through Circle Gateway on 11 chains; $0.001 on Base or Solana".
+ */
+function pricesOn(price: string, plain: readonly PlainRail[], gatewayMore = 0): string {
+  if (gatewayMore > 0) {
+    const plainByPrice = new Map<string, string[]>();
+    for (const p of plain) {
+      const there = atLeast(price, p.minPrice);
+      plainByPrice.set(there, [...(plainByPrice.get(there) ?? []), p.name]);
+    }
+    return [`${price} in USDC through Circle Gateway on ${gatewayMore + 1} chains`, ...[...plainByPrice].map(([at, names]) => `${at} on ${either(names)}`)].join("; ");
+  }
   const byPrice = new Map<string, string[]>([[price, ["Arc"]]]);
   for (const p of plain) {
     const there = atLeast(price, p.minPrice);
@@ -54,9 +77,11 @@ function guidance(opts: OpenApiOptions): string {
   const plain = opts.plain ?? [];
   const names = plain.map((p) => p.name);
   const min = plain.find((p) => p.minPrice)?.minPrice;
+  const gateway = opts.gateway ?? [];
+  const gatewayWhere = gateway.length ? `Circle Gateway on Arc, ${either(gateway.map((g) => g.name))}` : "Arc through Circle Gateway";
   const networks = plain.length
-    ? `The 402 lists every network the route takes, so pick the one your wallet is on: Arc through Circle Gateway (deposit once, then each call is a signature, with no gas), or ${either(names)} with a plain x402 payment${min ? `, where a call costs at least ${min}` : ""}.`
-    : "On Arc it is paid through Circle Gateway: deposit once, then each call is a signature, with no gas.";
+    ? `The 402 lists every network the route takes, so pick the one your wallet is on: ${gatewayWhere} (deposit once, then each call is a signature, with no gas), or ${either(names)} with a plain x402 payment${min ? `, where a call costs at least ${min}` : ""}.`
+    : `It is paid through ${gateway.length ? gatewayWhere : "Circle Gateway on Arc"}: deposit once, then each call is a signature, with no gas.`;
   const direct = opts.direct
     ? ` The same routes are served under /v1/direct for a direct EIP-3009 payment on Arc from any wallet, with no deposit, at $${opts.direct.floorUsdc} or more a call, since each one is settled on its own.`
     : "";
@@ -88,7 +113,10 @@ const baseUnits = (price: string): string => {
 export function buildOpenApi(opts: OpenApiOptions): Record<string, unknown> {
   const paths: Record<string, unknown> = {};
   const plain = opts.plain ?? [];
-  const everywhere = either(["Arc", ...plain.map((p) => p.name)]);
+  const gateway = opts.gateway ?? [];
+  // upto is not a Gateway scheme: billed by use is Arc, Base and Solana only, whatever Gateway takes.
+  const uptoWhere = either(["Arc", ...plain.map((p) => p.name)]);
+  const everywhere = gateway.length ? `${gateway.length + 1} chains through Circle Gateway${plain.length ? ` or on ${either(plain.map((p) => p.name))}` : ""}` : uptoWhere;
   /** The same payment on Base or Solana: a plain transfer there, at no less than that facilitator's minimum. */
   const plainProtocols = (scheme: "exact" | "upto", price: string) =>
     plain.map((p) => ({ x402: { protocol: "x402", version: 2, scheme, network: p.network, asset: p.asset, amount: baseUnits(atLeast(price, p.minPrice)), payTo: p.payTo, maxTimeoutSeconds: 300 } }));
@@ -132,6 +160,7 @@ export function buildOpenApi(opts: OpenApiOptions): Record<string, unknown> {
                 maxTimeoutSeconds: 604900,
               },
             },
+            ...gateway.map((g) => ({ x402: { protocol: "x402", version: 2, scheme: "exact", network: g.network, asset: g.asset, amount: baseUnits(r.price), payTo: opts.sellerAddress, maxTimeoutSeconds: 604900 } })),
             ...plainProtocols("exact", r.price),
           ],
         },
@@ -140,7 +169,7 @@ export function buildOpenApi(opts: OpenApiOptions): Record<string, unknown> {
             ? { "500": { description: "Always. The payment is verified but never settled." } }
             : { "200": { description: r.summary, content: { "application/json": { schema: { type: "object" } } } } }),
           "402": {
-            description: `Payment required: ${pricesOn(r.price, plain)}. Requirements are in the payment-required header.`,
+            description: `Payment required: ${pricesOn(r.price, plain, gateway.length)}. Requirements are in the payment-required header.`,
             content: { "application/json": { schema: { type: "object" }, ...(r.preview ? { example: r.preview } : {}) } },
           },
         },
@@ -178,7 +207,7 @@ export function buildOpenApi(opts: OpenApiOptions): Record<string, unknown> {
         },
         responses: {
           "200": { description: "The answer, what was charged, and every payment the agent made.", content: { "application/json": { schema: { type: "object" } } } },
-          "402": { description: `Payment required: up to $${ceilingUsdc} in USDC on ${everywhere}, x402 upto. Requirements are in the payment-required header.`, content: { "application/json": { schema: { type: "object" } } } },
+          "402": { description: `Payment required: up to $${ceilingUsdc} in USDC on ${uptoWhere}, x402 upto. Requirements are in the payment-required header.`, content: { "application/json": { schema: { type: "object" } } } },
         },
       },
     };

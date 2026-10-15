@@ -1,9 +1,9 @@
 import type { Hono } from "hono";
 import { compareUsdc6, formatUsdc6, parseUsdc6 } from "@cra-agent/accounting";
 import type { Logger } from "pino";
-import { BASE_MAINNET, createSeller, SOLANA_MAINNET, type SettlementEvent } from "@cra-agent/seller";
+import { BASE_MAINNET, createSeller, GATEWAY_MAINNETS, gatewayExtraNetworks, SOLANA_MAINNET, type SellerConfig, type SettlementEvent } from "@cra-agent/seller";
 import type { Db } from "./db.js";
-import type { PlainRail } from "./openapi.js";
+import type { GatewayChain, PlainRail } from "./openapi.js";
 import { deployStats, feeEstimate, feeSummary, fxSummary, marketPrices, recentDeploys, recordSettlement, rpcStatus } from "./queries.js";
 import { PAIRS, resolvePair } from "./pairs.js";
 import { PAID_ROUTES, type QueryParam } from "./routes.js";
@@ -34,6 +34,25 @@ function querySchema(params: readonly QueryParam[]): Record<string, unknown> {
   };
 }
 
+/** Which rail a settled payment came by, for /status: Arc's own, Solana, Base's plain transfer, or Gateway elsewhere. */
+export function railOf(network: string, arcNetwork: string, arcRail: "gateway" | "direct"): "gateway" | "direct" | "solana" | "base" {
+  if (network === arcNetwork) return arcRail;
+  if (network.startsWith("solana:")) return "solana";
+  // Base is paid with a plain transfer through Coinbase's facilitator; every other EVM chain we take is Gateway.
+  return network === BASE_MAINNET ? "base" : "gateway";
+}
+
+/**
+ * The chains besides Arc that /v1/paid takes Circle Gateway on. GATEWAY_NETWORKS: unset is every one Circle
+ * settles (mainnet only), "off" is none, otherwise a comma-separated list of CAIP-2 networks.
+ */
+export function gatewayNetworksFromEnv(value: string | undefined): SellerConfig["gatewayNetworks"] {
+  const v = value?.trim();
+  if (v === undefined || v === "" || v === "all") return "all";
+  if (v === "off" || v === "arc") return undefined;
+  return v.split(",").map((n) => n.trim()).filter(Boolean) as `${string}:${string}`[];
+}
+
 /** USDC on Base and on Solana: what a plain payment there is made in. */
 const BASE_USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 const SOLANA_USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
@@ -42,7 +61,7 @@ const SOLANA_USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
  * The first paid endpoints on the rail: our own Arc data, priced per call, paid via x402 + Circle Gateway.
  * Enabled only when SELLER_ADDRESS is set; the free /v1 routes stay free.
  */
-export function mountPaidRoutes(app: Hono, db: Db, network: string, log: Logger, usyc: UsycReader | null = null): { networks: string[]; plainNetworks: string[]; plain: PlainRail[] } | null {
+export function mountPaidRoutes(app: Hono, db: Db, network: string, log: Logger, usyc: UsycReader | null = null): { networks: string[]; plainNetworks: string[]; plain: PlainRail[]; gateway: GatewayChain[] } | null {
   const sellerAddress = process.env.SELLER_ADDRESS;
   if (!sellerAddress) {
     log.warn("SELLER_ADDRESS not set: paid endpoints disabled");
@@ -76,21 +95,26 @@ export function mountPaidRoutes(app: Hono, db: Db, network: string, log: Logger,
     } catch {
       route = null;
     }
-    const row = { rail: e.network === arcNetwork ? arcRail : e.network.startsWith("solana:") ? ("solana" as const) : ("base" as const), network: e.network, outcome: e.outcome, payer: e.payer, payTo: e.payTo, amountUsdc6: e.amount, tx: e.transaction, reason: e.reason, route };
+    const row = { rail: railOf(e.network, arcNetwork, arcRail), network: e.network, outcome: e.outcome, payer: e.payer, payTo: e.payTo, amountUsdc6: e.amount, tx: e.transaction, reason: e.reason, route };
     return recordSettlement(db, row).catch((err: unknown) => log.warn({ err, tx: e.transaction }, "settlement not recorded"));
   };
 
   // Priced from the shared catalogue, so the OpenAPI document and the 402 always agree.
   // The same routes for sale to buyers on Solana, paid there. On by giving a Solana address.
   const solanaPayTo = process.env.SOLANA_SELLER_ADDRESS;
-  const seller = createSeller({
+  const gatewayNetworks = gatewayNetworksFromEnv(process.env.GATEWAY_NETWORKS);
+  const paidConfig: SellerConfig = {
     sellerAddress,
     network: network === "mainnet" ? "arc" : "arcTestnet",
     serviceName: "CRA AGENT data",
     onSettlement: record("gateway"),
     ...(solanaPayTo ? { solana: { payTo: solanaPayTo, ...cdpMin } } : {}),
     ...(discovery ? { discovery } : {}),
-  });
+    ...(gatewayNetworks ? { gatewayNetworks } : {}),
+  };
+  const seller = createSeller(paidConfig);
+  // Gateway on the other chains Circle settles: what the 402 offers there, for the OpenAPI document and the bazaar.
+  const gateway: GatewayChain[] = gatewayExtraNetworks(paidConfig).map((n) => ({ network: n, name: GATEWAY_MAINNETS[n]!.name, asset: GATEWAY_MAINNETS[n]!.usdc }));
   for (const r of PAID_ROUTES) {
     seller.route(`GET ${r.path}`, r.price, {
       description: r.description,
@@ -241,7 +265,7 @@ export function mountPaidRoutes(app: Hono, db: Db, network: string, log: Logger,
     ...(discovery ? [{ network: BASE_MAINNET, name: "Base", asset: BASE_USDC, payTo: basePayTo, ...cdpMin }] : []),
     ...(solanaPayTo ? [{ network: SOLANA_MAINNET, name: "Solana", asset: SOLANA_USDC, payTo: solanaPayTo, ...cdpMin }] : []),
   ];
-  const networks = [seller.network, ...plain.map((p) => p.network)];
+  const networks = [seller.network, ...gateway.map((g) => g.network), ...plain.map((p) => p.network)];
   app.get("/v1/direct", (c) => c.json(directFacilitator ? { settlement: "direct", network: seller.network, payTo: seller.sellerAddress, asset: "0x3600000000000000000000000000000000000000", note: "Sign an EIP-3009 authorization from your wallet. No deposit, no gas on your side.", routes: PAID_ROUTES.map((r) => ({ route: `GET ${r.path.replace("/v1/paid", "/v1/direct")}`, summary: r.summary, group: r.group, label: r.plain.label, explain: r.plain.explain, priceUsd: directPriceOf(r.price), params: r.params ?? [], alwaysFails: r.alwaysFails === true })) } : { settlement: "off" }));
   // The same self-description the sell command serves, so a directory reads us the way it reads anyone.
   app.get("/.well-known/x402", (c) =>
@@ -253,7 +277,7 @@ export function mountPaidRoutes(app: Hono, db: Db, network: string, log: Logger,
       payTo: seller.sellerAddress,
       ...(solanaPayTo ? { solana: { payTo: solanaPayTo } } : {}),
       networks,
-      settlement: directFacilitator ? "circle-gateway on /v1/paid, direct on /v1/direct" : "circle-gateway",
+      settlement: `circle-gateway on /v1/paid${gateway.length ? ` (Arc and ${gateway.length} more chains)` : ""}${directFacilitator ? ", direct on /v1/direct" : ""}`,
       routes: PAID_ROUTES.filter((r) => !r.alwaysFails).map((r) => ({ pattern: `GET ${r.path}`, priceUsd: r.price.replace("$", ""), description: r.summary })),
       // Registered from the payout address itself, on 2026-09-23 (tx 0xecbd1594…7eff): owner and agentWallet are payTo.
       erc8004: { agentId: 186, agentRegistry: "eip155:5042:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432", card: "https://cra-agent.tech/.well-known/agent.json" },
@@ -261,7 +285,7 @@ export function mountPaidRoutes(app: Hono, db: Db, network: string, log: Logger,
     }),
   );
   app.get("/v1/paid", (c) => c.json({ seller: seller.sellerAddress, network: seller.network, facilitator: seller.facilitatorUrl, routes: Object.entries(seller.routes).map(([k, v]) => ({ route: k, price: String((Array.isArray(v.accepts) ? v.accepts[0] : v.accepts)?.price), description: v.description ?? null })) }));
-  log.info({ seller: sellerAddress, network: seller.network, routes: Object.keys(seller.routes).length, solana: solanaPayTo ?? "off", discovery: discovery ? `${basePayTo} via ${cdpKeyId && cdpKeySecret ? "coinbase (CDP), which also takes Solana" : discoveryFacilitator}` : "off" }, "paid endpoints mounted");
+  log.info({ seller: sellerAddress, network: seller.network, routes: Object.keys(seller.routes).length, gatewayChains: gateway.map((g) => g.name), solana: solanaPayTo ?? "off", discovery: discovery ? `${basePayTo} via ${cdpKeyId && cdpKeySecret ? "coinbase (CDP), which also takes Solana" : discoveryFacilitator}` : "off" }, "paid endpoints mounted");
   // On Arc a /v1/paid route is paid through Circle Gateway; on Base and Solana with a plain transfer.
-  return { networks, plainNetworks: plain.map((p) => p.network), plain };
+  return { networks, plainNetworks: plain.map((p) => p.network), plain, gateway };
 }

@@ -94,3 +94,29 @@ describe("the OpenAPI document agents and directories read", () => {
     expect(arcOnly.paths["/v1/paid/fees/estimate"].get.responses["402"].description).toMatch(/^Payment required: \$0\.0005 in USDC on Arc\./);
   });
 });
+
+describe("Circle Gateway on more chains than Arc", () => {
+  const GATEWAY = [
+    { network: "eip155:137", name: "Polygon", asset: "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359" },
+    { network: "eip155:42161", name: "Arbitrum", asset: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831" },
+  ];
+  const d = spec(PAY_TO, { plain: [BASE, SOLANA], gateway: GATEWAY, upto: UPTO });
+
+  it("lists Gateway on each chain right after Arc, at the Arc price, with that chain's USDC", () => {
+    const cheap = d.paths["/v1/paid/fees/estimate"].get;
+    expect(cheap["x-payment-info"].protocols.map((p: any) => [p.x402.network, p.x402.amount, p.x402.asset.slice(0, 6)])).toEqual([
+      ["eip155:5042", "500", "0x3600"],
+      ["eip155:137", "500", "0x3c49"],
+      ["eip155:42161", "500", "0xaf88"],
+      [BASE.network, "1000", "0x8335"],
+      [SOLANA.network, "1000", "EPjFWd"],
+    ]);
+    expect(cheap.responses["402"].description).toBe("Payment required: $0.0005 in USDC through Circle Gateway on 3 chains; $0.001 on Base or Solana. Requirements are in the payment-required header.");
+  });
+
+  it("names the chains for an agent, and keeps billing by use where it is", () => {
+    expect(d.info.description).toMatch(/^Data for agents by the call, paid in USDC over x402 on 3 chains through Circle Gateway or on Base or Solana: /);
+    expect(d.info["x-guidance"]).toMatch(/Circle Gateway on Arc, Polygon or Arbitrum \(deposit once, then each call is a signature, with no gas\), or Base or Solana with a plain x402 payment/);
+    expect(d.paths["/v1/upto/think"].get.responses["402"].description).toMatch(/up to \$0\.10 in USDC on Arc, Base or Solana, x402 upto/);
+  });
+});
