@@ -80,7 +80,9 @@ export interface Fetched {
   readonly hops: readonly Hop[];
 }
 export interface SafeFetchOptions {
-  readonly method?: "GET" | "HEAD";
+  readonly method?: "GET" | "HEAD" | "POST";
+  /** JSON sent only for a documented, unpaid POST probe. */
+  readonly body?: string;
   readonly maxBytes?: number;
   readonly timeoutMs?: number;
   readonly maxRedirects?: number;
@@ -88,12 +90,12 @@ export interface SafeFetchOptions {
 
 const UA = "cra-agent/0.1 (+https://cra-agent.tech)";
 
-function once(url: URL, method: string, maxBytes: number, deadline: number): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: Buffer; truncated: boolean }> {
+function once(url: URL, method: string, maxBytes: number, deadline: number, body?: string): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: Buffer; truncated: boolean }> {
   return new Promise((resolve, reject) => {
     const left = deadline - Date.now();
     if (left <= 0) return reject(new Error("timed out"));
     const lib = url.protocol === "https:" ? https : http;
-    const req = lib.request(url, { method, lookup: guardedLookup as never, headers: { "user-agent": UA, accept: "text/html,application/xhtml+xml,*/*;q=0.8", "accept-encoding": "gzip, br" }, timeout: left }, (res) => {
+    const req = lib.request(url, { method, lookup: guardedLookup as never, headers: { "user-agent": UA, accept: "text/html,application/xhtml+xml,*/*;q=0.8", "accept-encoding": "gzip, br", ...(body === undefined ? {} : { "content-type": "application/json", "content-length": Buffer.byteLength(body) }) }, timeout: left }, (res) => {
       const chunks: Buffer[] = [];
       let size = 0;
       let truncated = false;
@@ -113,7 +115,7 @@ function once(url: URL, method: string, maxBytes: number, deadline: number): Pro
     });
     req.on("timeout", () => req.destroy(new Error("timed out")));
     req.on("error", reject);
-    req.end();
+    req.end(body);
   });
 }
 
@@ -131,16 +133,20 @@ function decoded(body: Buffer, encoding: string | undefined, truncated: boolean)
 }
 
 export async function safeFetch(raw: string, opts: SafeFetchOptions = {}): Promise<Fetched> {
+  if (opts.body !== undefined && opts.method !== "POST") throw new Error("a request body requires POST");
+  if (opts.method === "POST" && (!opts.body || Buffer.byteLength(opts.body) > 8192)) throw new Error("POST probe needs a JSON body of at most 8192 bytes");
   const maxBytes = opts.maxBytes ?? 1_500_000;
   const deadline = Date.now() + (opts.timeoutMs ?? 8000);
   const hops: Hop[] = [];
   let url = checkUrl(raw);
   for (let i = 0; ; i++) {
     const started = Date.now();
-    const res = await once(url, opts.method ?? "GET", maxBytes, deadline);
+    const res = await once(url, opts.method ?? "GET", maxBytes, deadline, opts.body);
     hops.push({ url: url.toString(), status: res.status, ms: Date.now() - started });
     const location = res.headers.location;
     if (res.status >= 300 && res.status < 400 && location) {
+      // Never replay a POST body at a redirect target, even when it looks public.
+      if (opts.method === "POST") throw new Error("POST probe redirected");
       if (i >= (opts.maxRedirects ?? 5)) throw new Error("too many redirects");
       url = checkUrl(new URL(location, url).toString());
       continue;

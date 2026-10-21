@@ -21,6 +21,8 @@ export { clean };
 
 export interface Probe {
   url: string;
+  method: "GET" | "POST";
+  body: Record<string, unknown> | null;
   host: string;
   name: string | null;
   description: string | null;
@@ -80,6 +82,23 @@ export function categoryOf(named: unknown, tags: readonly string[]): string | nu
 
 export class NotListable extends Error {}
 
+/** Only probe a POST when the seller publishes a small example for this exact route. */
+export function documentedPost(url: URL, doc: unknown): Record<string, unknown> | null {
+  if (!doc || typeof doc !== "object" || !("paths" in doc)) return null;
+  const paths = (doc as { paths?: unknown }).paths;
+  if (!paths || typeof paths !== "object") return null;
+  const path = (paths as Record<string, unknown>)[url.pathname];
+  if (!path || typeof path !== "object" || !("payment" in path)) return null;
+  const payment = (path as { payment?: unknown }).payment;
+  if (!payment || typeof payment !== "object") return null;
+  const p = payment as { endpoint?: unknown; method?: unknown; exampleRequest?: unknown };
+  if (p.method !== "POST" || p.endpoint !== url.toString()) return null;
+  const example = p.exampleRequest;
+  if (!example || typeof example !== "object" || Array.isArray(example)) return null;
+  const encoded = JSON.stringify(example);
+  return encoded && Buffer.byteLength(encoded) <= 8192 ? example as Record<string, unknown> : null;
+}
+
 interface Accept {
   scheme?: string;
   network?: string;
@@ -114,10 +133,32 @@ export async function probe(rawUrl: string, network: string): Promise<Probe> {
   const url = checkUrl(rawUrl);
   if (url.protocol !== "https:") throw new NotListable("buyers need https: list the public https address");
   url.hash = "";
-  const res = await safeFetch(url.toString(), { maxBytes: 64_000, timeoutMs: 10_000 }).catch((err: Error) => {
+  let res = await safeFetch(url.toString(), { maxBytes: 64_000, timeoutMs: 10_000 }).catch((err: Error) => {
     throw err instanceof UnsafeUrl ? err : new NotListable(`could not reach it: ${err.message}`);
   });
-  if (res.status !== 402) throw new NotListable(`it answered ${res.status}, not 402 Payment Required. List the address of a paid route, called without paying`);
+  let method: Probe["method"] = "GET";
+  let body: Probe["body"] = null;
+  let doc: Record<string, unknown> | null = null;
+  // Fetch only the seller's own manifest. It may describe a body-bound POST that GET cannot quote.
+  try {
+    const wk = await safeFetch(`${url.origin}/.well-known/x402`, { maxBytes: 64_000, timeoutMs: 6000 });
+    if (wk.status === 200 && !wk.truncated) {
+      const parsed: unknown = JSON.parse(wk.body.toString("utf8"));
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) doc = parsed as Record<string, unknown>;
+    }
+  } catch {
+    /* the route's own 402 is sufficient for a GET listing */
+  }
+  if (res.status !== 402 && doc) {
+    body = documentedPost(url, doc);
+    if (body) {
+      method = "POST";
+      res = await safeFetch(url.toString(), { method, body: JSON.stringify(body), maxBytes: 64_000, timeoutMs: 10_000, maxRedirects: 0 }).catch((err: Error) => {
+        throw err instanceof UnsafeUrl ? err : new NotListable(`could not quote its documented POST: ${err.message}`);
+      });
+    }
+  }
+  if (res.status !== 402) throw new NotListable(`it answered ${res.status}, not 402 Payment Required. List a paid GET route or a POST route documented with an example request in /.well-known/x402`);
   const { accept, description, networks, tags: challengeTags } = readChallenge(res.headers["payment-required"], res.body.toString("utf8"), network);
 
   // A seller running our proxy, or anyone who cares to, names itself here. Optional: a miss changes nothing.
@@ -128,18 +169,18 @@ export async function probe(rawUrl: string, network: string): Promise<Probe> {
   let named: unknown = null;
   let siteTags: unknown = null;
   try {
-    const wk = await safeFetch(`${url.origin}/.well-known/x402`, { maxBytes: 64_000, timeoutMs: 6000 });
-    if (wk.status === 200) {
-      const doc = JSON.parse(wk.body.toString("utf8")) as { name?: unknown; description?: unknown; category?: unknown; tags?: unknown; routes?: Array<{ pattern?: unknown; priceUsd?: unknown; description?: unknown }> };
+    if (doc) {
       name = clean(doc.name, 80);
       about = clean(doc.description, 240);
       named = doc.category;
       siteTags = doc.tags;
       if (Array.isArray(doc.routes)) {
-        routes = doc.routes.slice(0, 40).flatMap((r) => {
-          const pattern = clean(r.pattern, 120);
-          const priceUsd = clean(r.priceUsd, 16);
-          return pattern && priceUsd && /^\d+(\.\d+)?$/.test(priceUsd) ? [{ pattern, priceUsd, description: clean(r.description, 200) }] : [];
+        routes = doc.routes.slice(0, 40).flatMap((r: unknown) => {
+          if (!r || typeof r !== "object") return [];
+          const route = r as { pattern?: unknown; priceUsd?: unknown; description?: unknown };
+          const pattern = clean(route.pattern, 120);
+          const priceUsd = clean(route.priceUsd, 16);
+          return pattern && priceUsd && /^\d+(\.\d+)?$/.test(priceUsd) ? [{ pattern, priceUsd, description: clean(route.description, 200) }] : [];
         });
       }
     }
@@ -147,11 +188,13 @@ export async function probe(rawUrl: string, network: string): Promise<Probe> {
     /* no self-description: the 402 is enough */
   }
   const tags = cleanTags(challengeTags, siteTags);
-  return { url: url.toString(), host: url.host, name, description: description ?? about, payTo: accept.payTo!.toLowerCase(), network, amountUsdc6: accept.amount!, rail: accept.extra?.name === "GatewayWalletBatched" ? "gateway" : "direct", networks, routes, category: categoryOf(named, tags), tags };
+  return { url: url.toString(), method, body, host: url.host, name, description: description ?? about, payTo: accept.payTo!.toLowerCase(), network, amountUsdc6: accept.amount!, rail: accept.extra?.name === "GatewayWalletBatched" ? "gateway" : "direct", networks, routes, category: categoryOf(named, tags), tags };
 }
 
 interface Row {
   url: string;
+  method: "GET" | "POST";
+  body: Record<string, unknown> | null;
   host: string;
   name: string | null;
   description: string | null;
@@ -226,10 +269,10 @@ export function mountMarket(app: Hono, db: Db, network: string, log: Logger, opt
   const circle = opts.circle === undefined ? defaultCircle(network, caip2, log, db) : opts.circle;
   const upsert = (p: Probe): Promise<unknown> =>
     db.query(
-      `INSERT INTO market_listings (url, host, name, description, pay_to, network, amount_usdc6, rail, routes, networks, category, tags)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-       ON CONFLICT (url) DO UPDATE SET name = $3, description = $4, pay_to = $5, amount_usdc6 = $7, rail = $8, routes = $9, networks = $10, category = $11, tags = $12, checked_at = now(), ok = true, fails = 0`,
-      [p.url, p.host, p.name, p.description, p.payTo, p.network, p.amountUsdc6, p.rail, p.routes ? JSON.stringify(p.routes) : null, p.networks, p.category, p.tags],
+      `INSERT INTO market_listings (url, host, name, description, pay_to, network, amount_usdc6, rail, routes, networks, category, tags, method, body)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+       ON CONFLICT (url) DO UPDATE SET name = $3, description = $4, pay_to = $5, amount_usdc6 = $7, rail = $8, routes = $9, networks = $10, category = $11, tags = $12, method = $13, body = $14, checked_at = now(), ok = true, fails = 0`,
+      [p.url, p.host, p.name, p.description, p.payTo, p.network, p.amountUsdc6, p.rail, p.routes ? JSON.stringify(p.routes) : null, p.networks, p.category, p.tags, p.method, p.body ? JSON.stringify(p.body) : null],
     );
 
   /** One submitter cannot flood the page: a handful of tries an hour per address. */
@@ -253,7 +296,7 @@ export function mountMarket(app: Hono, db: Db, network: string, log: Logger, opt
       if (Number(counts.rows[0]!.host) >= 25) return c.json({ error: "this site already has 25 listings: list the ones that matter" }, 400);
       await upsert(p);
       log.info({ url: p.url, payTo: p.payTo, rail: p.rail }, "market listing added");
-      return c.json({ listed: true, listing: { url: p.url, name: p.name, description: p.description, priceUsd: usd(p.amountUsdc6), payTo: p.payTo, rail: p.rail } });
+      return c.json({ listed: true, listing: { url: p.url, method: p.method, body: p.body, name: p.name, description: p.description, priceUsd: usd(p.amountUsdc6), payTo: p.payTo, rail: p.rail } });
     } catch (err) {
       if (err instanceof NotListable || err instanceof UnsafeUrl) return c.json({ error: err.message }, 400);
       throw err;
@@ -287,13 +330,13 @@ export function mountMarket(app: Hono, db: Db, network: string, log: Logger, opt
     void refresh();
     // A listing that has failed two days of checks is gone, not offline.
     const rows = await db.query<Row>(
-      `SELECT url, host, name, description, pay_to, amount_usdc6, rail, routes, networks, category, tags, extract(epoch FROM added_at)::bigint AS added_at, extract(epoch FROM checked_at)::bigint AS checked_at, ok
+      `SELECT url, method, body, host, name, description, pay_to, amount_usdc6, rail, routes, networks, category, tags, extract(epoch FROM added_at)::bigint AS added_at, extract(epoch FROM checked_at)::bigint AS checked_at, ok
        FROM market_listings WHERE NOT hidden AND fails < 48 ORDER BY ok DESC, added_at DESC LIMIT 500`,
     );
     return c.json({
       network: caip2,
       note: "Everything shown about a listing was read from the endpoint itself, called without paying. We do not vouch for what it sells: check the price your wallet or your agent shows before paying.",
-      listings: rows.rows.map((r) => ({ url: r.url, host: r.host, name: r.name, description: r.description, priceUsd: usd(r.amount_usdc6), payTo: r.pay_to, rail: r.rail, networks: r.networks ?? [r.network ?? caip2], routes: r.routes, category: r.category ?? null, tags: r.tags ?? [], online: r.ok, addedAt: Number(r.added_at), checkedAt: Number(r.checked_at) })),
+      listings: rows.rows.map((r) => ({ url: r.url, method: r.method, body: r.body, host: r.host, name: r.name, description: r.description, priceUsd: usd(r.amount_usdc6), payTo: r.pay_to, rail: r.rail, networks: r.networks ?? [r.network ?? caip2], routes: r.routes, category: r.category ?? null, tags: r.tags ?? [], online: r.ok, addedAt: Number(r.added_at), checkedAt: Number(r.checked_at) })),
     });
   });
 
@@ -303,10 +346,10 @@ export function mountMarket(app: Hono, db: Db, network: string, log: Logger, opt
     if (Date.now() - listed.at < 30_000) return listed.items;
     const exists = await db.query<{ t: string | null }>("SELECT to_regclass('public.market_listings')::text AS t");
     if (!exists.rows[0]?.t) return [];
-    const rows = await db.query<Row>(`SELECT url, host, name, description, pay_to, amount_usdc6, rail, routes, networks, category, tags, ok FROM market_listings WHERE NOT hidden AND fails < 48 LIMIT 2000`);
+    const rows = await db.query<Row>(`SELECT url, method, body, host, name, description, pay_to, amount_usdc6, rail, routes, networks, category, tags, ok FROM market_listings WHERE NOT hidden AND fails < 48 LIMIT 2000`);
     const items: SearchItem[] = rows.rows.map((r) => ({
       url: r.url,
-      method: "GET",
+      method: r.method,
       priceUsd: usd(r.amount_usdc6),
       name: r.name ?? r.host,
       label: null,
@@ -317,7 +360,7 @@ export function mountMarket(app: Hono, db: Db, network: string, log: Logger, opt
       network: caip2,
       rail: r.rail === "gateway" ? "gateway" : "direct",
       direct: null,
-      body: null,
+      body: r.body,
       source: "market",
       category: r.category ?? null,
       site: new URL(r.url).origin,

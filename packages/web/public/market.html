@@ -78,7 +78,7 @@
     </div>
 
     <div class="chart-card wide">
-      <div class="head"><div><h2>Add yours</h2><div class="sub">Paste the address of a paid route, exactly as a buyer would call it. We call it once without paying: if it answers “402 Payment Required” with a price on Arc, it is listed. You cannot write anything about it here. The name, the price and who gets paid are read from your endpoint, so the list cannot say what your endpoint does not.</div></div></div>
+      <div class="head"><div><h2>Add yours</h2><div class="sub">Paste the address of a paid route, exactly as a buyer would call it. We probe it without paying: a GET must answer “402 Payment Required,” or a POST must publish an example request for that exact route in <span class="mono">/.well-known/x402</span> and answer 402 to that request. The Arc price, payee and example body come from your endpoint, not this form.</div></div></div>
       <div class="fields">
         <label class="field"><span>Address of a paid route</span><input id="m-url" type="url" inputmode="url" spellcheck="false" autocomplete="off" placeholder="https://api.example.com/v1/forecast?city=milan"></label>
       </div>

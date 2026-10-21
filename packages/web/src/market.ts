@@ -10,6 +10,7 @@ initChrome();
 
 interface Listing {
   url: string;
+  method: "GET" | "POST";
   host: string;
   name: string | null;
   description: string | null;
@@ -39,7 +40,7 @@ const link = (url: string, text: string): string => (/^https:\/\//i.test(url) ? 
 
 function row(l: Listing): string {
   const more = l.routes && l.routes.length > 1 ? `<div class="sub">${l.routes.length} priced paths, from $${esc([...l.routes].sort((a, b) => Number(a.priceUsd) - Number(b.priceUsd))[0]!.priceUsd)}</div>` : "";
-  return `<tr><td><b>${esc(l.name ?? l.host)}</b><div class="sub mono">${link(l.url, l.host)}</div></td><td>${esc(l.description ?? "—")}${more}</td><td class="num">$${esc(l.priceUsd)}</td><td>${esc(whoCanPay(l))}</td><td class="mono"><a href="${EXPLORER}/address/${esc(l.payTo)}" rel="noopener">${esc(short(l.payTo))}</a></td><td>${
+  return `<tr><td><b>${esc(l.name ?? l.host)}</b><div class="sub mono">${esc(l.method)} ${link(l.url, l.host)}</div></td><td>${esc(l.description ?? "—")}${more}</td><td class="num">$${esc(l.priceUsd)}</td><td>${esc(whoCanPay(l))}</td><td class="mono"><a href="${EXPLORER}/address/${esc(l.payTo)}" rel="noopener">${esc(short(l.payTo))}</a></td><td>${
     l.online ? '<span class="status"><span class="dot ok"></span>answers</span>' : '<span class="status"><span class="dot bad"></span>not answering</span>'
   }<div class="sub">checked ${ago(l.checkedAt)}</div></td></tr>`;
 }
